@@ -46,6 +46,10 @@ extern "C" {
 #define CONFIG_ASYNC_TCP_USE_WDT 1 //if enabled, adds between 33us and 200us per event
 #endif
 
+#ifndef CONFIG_ASYNC_TCP_STACK_SIZE
+#define CONFIG_ASYNC_TCP_STACK_SIZE 8192 * 2
+#endif
+
 class AsyncClient;
 
 #define ASYNC_MAX_ACK_TIME 5000
