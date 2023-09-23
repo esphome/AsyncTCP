@@ -9,11 +9,11 @@ if [[ "$OSTYPE" == "linux"* ]]; then
 	export OS_IS_LINUX="1"
 	ARCHIVE_FORMAT="tar.xz"
 	if [[ "$OSBITS" == "i686" ]]; then
-		OS_NAME="linux32"
+		OS_NAME="Linux32"
 	elif [[ "$OSBITS" == "x86_64" ]]; then
-		OS_NAME="linux64"
+		OS_NAME="Linux_64bit"
 	elif [[ "$OSBITS" == "armv7l" || "$OSBITS" == "aarch64" ]]; then
-		OS_NAME="linuxarm"
+		OS_NAME="Linuxarm"
 	else
 		OS_NAME="$OSTYPE-$OSBITS"
 		echo "Unknown OS '$OS_NAME'"
@@ -50,12 +50,12 @@ fi
 
 if [ ! -d "$ARDUINO_IDE_PATH" ]; then
 	echo "Installing Arduino IDE on $OS_NAME ..."
-	echo "Downloading 'arduino-nightly-$OS_NAME.$ARCHIVE_FORMAT' to 'arduino.$ARCHIVE_FORMAT' ..."
+	echo "Downloading 'arduino-nightly-$OS_NAME.zip' to 'arduino.zip' ..."
 	if [ "$OS_IS_LINUX" == "1" ]; then
-		wget -O "arduino.$ARCHIVE_FORMAT" "https://www.arduino.cc/download.php?f=/arduino-nightly-$OS_NAME.$ARCHIVE_FORMAT" > /dev/null 2>&1
-		echo "Extracting 'arduino.$ARCHIVE_FORMAT' ..."
-		tar xf "arduino.$ARCHIVE_FORMAT" > /dev/null
-		mv arduino-nightly "$ARDUINO_IDE_PATH"
+		wget -O "arduino.zip" "https://downloads.arduino.cc/arduino-ide/nightly/arduino-ide_nightly-latest_$OS_NAME.zip" > /dev/null 2>&1
+		echo "Extracting 'arduino.zip' ..."
+		unzip "arduino.zip" > /dev/null
+		mv arduino-ide_nightly* "$ARDUINO_IDE_PATH"
 	else
 		curl -o "arduino.$ARCHIVE_FORMAT" -L "https://www.arduino.cc/download.php?f=/arduino-nightly-$OS_NAME.$ARCHIVE_FORMAT" > /dev/null 2>&1
 		echo "Extracting 'arduino.$ARCHIVE_FORMAT' ..."
@@ -66,7 +66,7 @@ if [ ! -d "$ARDUINO_IDE_PATH" ]; then
 			mv arduino-nightly "$ARDUINO_IDE_PATH"
 		fi
 	fi
-	rm -rf "arduino.$ARCHIVE_FORMAT"
+	#rm -rf "arduino.$ARCHIVE_FORMAT"
 
 	mkdir -p "$ARDUINO_USR_PATH/libraries"
 	mkdir -p "$ARDUINO_USR_PATH/hardware"
@@ -76,7 +76,7 @@ if [ ! -d "$ARDUINO_IDE_PATH" ]; then
 fi
 
 function build_sketch(){ # build_sketch <fqbn> <path-to-ino> [extra-options]
-    if [ "$#" -lt 2 ]; then
+	if [ "$#" -lt 2 ]; then
 		echo "ERROR: Illegal number of parameters"
 		echo "USAGE: build_sketch <fqbn> <path-to-ino> [extra-options]"
 		return 1
@@ -108,113 +108,111 @@ function build_sketch(){ # build_sketch <fqbn> <path-to-ino> [extra-options]
 		-build-cache "$ARDUINO_CACHE_DIR" \
 		-build-path "$ARDUINO_BUILD_DIR" \
 		$win_opts $xtra_opts "$sketch"
-}
+	}
 
-function count_sketches() # count_sketches <examples-path>
-{
-	local examples="$1"
-    rm -rf sketches.txt
-	if [ ! -d "$examples" ]; then
-		touch sketches.txt
+	function count_sketches() # count_sketches <examples-path>
+	{
+		local examples="$1"
+		rm -rf sketches.txt
+		if [ ! -d "$examples" ]; then
+			touch sketches.txt
+			return 0
+		fi
+		local sketches=$(find $examples -name *.ino)
+		local sketchnum=0
+		for sketch in $sketches; do
+			local sketchdir=$(dirname $sketch)
+			local sketchdirname=$(basename $sketchdir)
+			local sketchname=$(basename $sketch)
+			if [[ "${sketchdirname}.ino" != "$sketchname" ]]; then
+				continue
+			fi;
+			if [[ -f "$sketchdir/.test.skip" ]]; then
+				continue
+			fi
+			echo $sketch >> sketches.txt
+			sketchnum=$(($sketchnum + 1))
+		done
+		return $sketchnum
+	}
+
+	function build_sketches() # build_sketches <fqbn> <examples-path> <chunk> <total-chunks> [extra-options]
+	{
+		local fqbn=$1
+		local examples=$2
+		local chunk_idex=$3
+		local chunks_num=$4
+		local xtra_opts=$5
+
+		if [ "$#" -lt 2 ]; then
+			echo "ERROR: Illegal number of parameters"
+			echo "USAGE: build_sketches <fqbn> <examples-path> [<chunk> <total-chunks>] [extra-options]"
+			return 1
+		fi
+
+		if [ "$#" -lt 4 ]; then
+			chunk_idex="0"
+			chunks_num="1"
+			xtra_opts=$3
+		fi
+
+		if [ "$chunks_num" -le 0 ]; then
+			echo "ERROR: Chunks count must be positive number"
+			return 1
+		fi
+		if [ "$chunk_idex" -ge "$chunks_num" ]; then
+			echo "ERROR: Chunk index must be less than chunks count"
+			return 1
+		fi
+
+		set +e
+		count_sketches "$examples"
+		local sketchcount=$?
+		set -e
+		local sketches=$(cat sketches.txt)
+		rm -rf sketches.txt
+
+		local chunk_size=$(( $sketchcount / $chunks_num ))
+		local all_chunks=$(( $chunks_num * $chunk_size ))
+		if [ "$all_chunks" -lt "$sketchcount" ]; then
+			chunk_size=$(( $chunk_size + 1 ))
+		fi
+
+		local start_index=$(( $chunk_idex * $chunk_size ))
+		if [ "$sketchcount" -le "$start_index" ]; then
+			echo "Skipping job"
+			return 0
+		fi
+
+		local end_index=$(( $(( $chunk_idex + 1 )) * $chunk_size ))
+		if [ "$end_index" -gt "$sketchcount" ]; then
+			end_index=$sketchcount
+		fi
+
+		local start_num=$(( $start_index + 1 ))
+		echo "Found $sketchcount Sketches";
+		echo "Chunk Count : $chunks_num"
+		echo "Chunk Size  : $chunk_size"
+		echo "Start Sketch: $start_num"
+		echo "End Sketch  : $end_index"
+
+		local sketchnum=0
+		for sketch in $sketches; do
+			local sketchdir=$(dirname $sketch)
+			local sketchdirname=$(basename $sketchdir)
+			local sketchname=$(basename $sketch)
+			if [ "${sketchdirname}.ino" != "$sketchname" ] || [ -f "$sketchdir/.test.skip" ]; then
+				continue
+			fi
+			sketchnum=$(($sketchnum + 1))
+			if [ "$sketchnum" -le "$start_index" ] || [ "$sketchnum" -gt "$end_index" ]; then
+				continue
+			fi
+			build_sketch "$fqbn" "$sketch" "$xtra_opts"
+			local result=$?
+			if [ $result -ne 0 ]; then
+				return $result
+			fi
+		done
 		return 0
-	fi
-    local sketches=$(find $examples -name *.ino)
-    local sketchnum=0
-    for sketch in $sketches; do
-        local sketchdir=$(dirname $sketch)
-        local sketchdirname=$(basename $sketchdir)
-        local sketchname=$(basename $sketch)
-        if [[ "${sketchdirname}.ino" != "$sketchname" ]]; then
-            continue
-        fi;
-        if [[ -f "$sketchdir/.test.skip" ]]; then
-            continue
-        fi
-        echo $sketch >> sketches.txt
-        sketchnum=$(($sketchnum + 1))
-    done
-    return $sketchnum
-}
-
-function build_sketches() # build_sketches <fqbn> <examples-path> <chunk> <total-chunks> [extra-options]
-{
-    local fqbn=$1
-    local examples=$2
-    local chunk_idex=$3
-    local chunks_num=$4
-    local xtra_opts=$5
-
-    if [ "$#" -lt 2 ]; then
-		echo "ERROR: Illegal number of parameters"
-		echo "USAGE: build_sketches <fqbn> <examples-path> [<chunk> <total-chunks>] [extra-options]"
-		return 1
-	fi
-
-    if [ "$#" -lt 4 ]; then
-		chunk_idex="0"
-		chunks_num="1"
-		xtra_opts=$3
-	fi
-
-	if [ "$chunks_num" -le 0 ]; then
-		echo "ERROR: Chunks count must be positive number"
-		return 1
-	fi
-	if [ "$chunk_idex" -ge "$chunks_num" ]; then
-		echo "ERROR: Chunk index must be less than chunks count"
-		return 1
-	fi
-
-	set +e
-    count_sketches "$examples"
-    local sketchcount=$?
-	set -e
-    local sketches=$(cat sketches.txt)
-    rm -rf sketches.txt
-
-    local chunk_size=$(( $sketchcount / $chunks_num ))
-    local all_chunks=$(( $chunks_num * $chunk_size ))
-    if [ "$all_chunks" -lt "$sketchcount" ]; then
-    	chunk_size=$(( $chunk_size + 1 ))
-    fi
-
-    local start_index=$(( $chunk_idex * $chunk_size ))
-    if [ "$sketchcount" -le "$start_index" ]; then
-    	echo "Skipping job"
-    	return 0
-    fi
-
-    local end_index=$(( $(( $chunk_idex + 1 )) * $chunk_size ))
-    if [ "$end_index" -gt "$sketchcount" ]; then
-    	end_index=$sketchcount
-    fi
-
-    local start_num=$(( $start_index + 1 ))
-    echo "Found $sketchcount Sketches";
-    echo "Chunk Count : $chunks_num"
-    echo "Chunk Size  : $chunk_size"
-    echo "Start Sketch: $start_num"
-    echo "End Sketch  : $end_index"
-
-    local sketchnum=0
-    for sketch in $sketches; do
-        local sketchdir=$(dirname $sketch)
-        local sketchdirname=$(basename $sketchdir)
-        local sketchname=$(basename $sketch)
-        if [ "${sketchdirname}.ino" != "$sketchname" ] \
-        || [ -f "$sketchdir/.test.skip" ]; then
-            continue
-        fi
-        sketchnum=$(($sketchnum + 1))
-        if [ "$sketchnum" -le "$start_index" ] \
-        || [ "$sketchnum" -gt "$end_index" ]; then
-        	continue
-        fi
-        build_sketch "$fqbn" "$sketch" "$xtra_opts"
-        local result=$?
-        if [ $result -ne 0 ]; then
-            return $result
-        fi
-    done
-    return 0
-}
+	}
