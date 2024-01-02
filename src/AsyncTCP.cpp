@@ -746,6 +746,7 @@ bool AsyncClient::connect(const char* host, uint16_t port){
 
     err_t err = dns_gethostbyname(host, &addr, (dns_found_callback)&_tcp_dns_found, this);
     if(err == ERR_OK) {
+#if LWIP_IPV4 && LWIP_IPV6
         if(addr.type == IPADDR_TYPE_V6) {
             return connect(IPv6Address(addr.u_addr.ip6.addr), port);
         }
@@ -1017,7 +1018,6 @@ int8_t AsyncClient::_poll(tcp_pcb* pcb){
 }
 
 void AsyncClient::_dns_found(struct ip_addr *ipaddr){
-#if LWIP_IPV4 && LWIP_IPV6
     if(ipaddr && ipaddr->u_addr.ip4.addr){
         connect(IPAddress(ipaddr->u_addr.ip4.addr), _connect_port);
     } else if(ipaddr && ipaddr->u_addr.ip6.addr){
