@@ -23,7 +23,9 @@
 #define ASYNCTCP_H_
 
 #include "IPAddress.h"
+#if ESP_IDF_VERSION_MAJOR < 5
 #include "IPv6Address.h"
+#endif
 #include <functional>
 #include "lwip/ip_addr.h"
 #include "lwip/ip6_addr.h"
@@ -53,9 +55,20 @@ extern "C" {
 #define CONFIG_ASYNC_TCP_STACK_SIZE 8192 * 2
 #endif
 
+#ifndef CONFIG_ASYNC_TCP_PRIORITY
+#define CONFIG_ASYNC_TCP_PRIORITY 10
+#endif
+
+#ifndef CONFIG_ASYNC_TCP_QUEUE_SIZE
+#define CONFIG_ASYNC_TCP_QUEUE_SIZE 64
+#endif
+
+#ifndef CONFIG_ASYNC_TCP_MAX_ACK_TIME
+#define CONFIG_ASYNC_TCP_MAX_ACK_TIME 5000
+#endif
+
 class AsyncClient;
 
-#define ASYNC_MAX_ACK_TIME 5000
 #define ASYNC_WRITE_FLAG_COPY 0x01 //will allocate new buffer to hold the data while sending (else will hold reference to the data given)
 #define ASYNC_WRITE_FLAG_MORE 0x02 //will not send PSH flag, meaning that there should be more data to be sent before the application should react.
 
@@ -83,7 +96,9 @@ class AsyncClient {
       return !(*this == other);
     }
     bool connect(IPAddress ip, uint16_t port);
+#if ESP_IDF_VERSION_MAJOR < 5
     bool connect(IPv6Address ip, uint16_t port);
+#endif
     bool connect(const char *host, uint16_t port);
     void close(bool now = false);
     void stop();
@@ -117,6 +132,8 @@ class AsyncClient {
     void setNoDelay(bool nodelay);
     bool getNoDelay();
 
+    void setKeepAlive(uint32_t ms, uint8_t cnt);
+
     uint32_t getRemoteAddress();
     uint16_t getRemotePort();
     uint32_t getLocalAddress();
@@ -124,8 +141,13 @@ class AsyncClient {
 #if LWIP_IPV6
     ip6_addr_t getRemoteAddress6();
     ip6_addr_t getLocalAddress6();
+#if ESP_IDF_VERSION_MAJOR < 5
     IPv6Address remoteIP6();
     IPv6Address localIP6();
+#else
+    IPAddress remoteIP6();
+    IPAddress localIP6();
+#endif
 #endif
 
     //compatibility
@@ -157,7 +179,7 @@ class AsyncClient {
     static int8_t _s_lwip_fin(void *arg, struct tcp_pcb *tpcb, int8_t err);
     static void _s_error(void *arg, int8_t err);
     static int8_t _s_sent(void *arg, struct tcp_pcb *tpcb, uint16_t len);
-    static int8_t _s_connected(void* arg, void* tpcb, int8_t err);
+    static int8_t _s_connected(void* arg, struct tcp_pcb *tpcb, int8_t err);
     static void _s_dns_found(const char *name, struct ip_addr *ipaddr, void *arg);
 
     int8_t _recv(tcp_pcb* pcb, pbuf* pb, int8_t err);
@@ -197,8 +219,8 @@ class AsyncClient {
 
     int8_t _close();
     void _free_closed_slot();
-    void _allocate_closed_slot();
-    int8_t _connected(void* pcb, int8_t err);
+    bool _allocate_closed_slot();
+    int8_t _connected(tcp_pcb* pcb, int8_t err);
     void _error(int8_t err);
     int8_t _poll(tcp_pcb* pcb);
     int8_t _sent(tcp_pcb* pcb, uint16_t len);
@@ -214,7 +236,9 @@ class AsyncClient {
 class AsyncServer {
   public:
     AsyncServer(IPAddress addr, uint16_t port);
+#if ESP_IDF_VERSION_MAJOR < 5
     AsyncServer(IPv6Address addr, uint16_t port);
+#endif
     AsyncServer(uint16_t port);
     ~AsyncServer();
     void onClient(AcConnectHandler cb, void* arg);
@@ -233,7 +257,9 @@ class AsyncServer {
     bool _bind4 = false;
     bool _bind6 = false;
     IPAddress _addr;
+#if ESP_IDF_VERSION_MAJOR < 5
     IPv6Address _addr6;
+#endif
     bool _noDelay;
     tcp_pcb* _pcb;
     AcConnectHandler _connect_cb;

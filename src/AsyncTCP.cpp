@@ -46,7 +46,7 @@ typedef struct {
         void *arg;
         union {
                 struct {
-                        void * pcb;
+                        tcp_pcb * pcb;
                         int8_t err;
                 } connected;
                 struct {
@@ -78,7 +78,7 @@ typedef struct {
         };
 } lwip_event_packet_t;
 
-static xQueueHandle _async_queue;
+static QueueHandle_t _async_queue;
 static TaskHandle_t _async_service_task_handle = NULL;
 
 
@@ -97,7 +97,7 @@ static uint32_t _closed_index = []() {
 
 static inline bool _init_async_event_queue(){
     if(!_async_queue){
-        _async_queue = xQueueCreate(32, sizeof(lwip_event_packet_t *));
+        _async_queue = xQueueCreate(CONFIG_ASYNC_TCP_QUEUE_SIZE, sizeof(lwip_event_packet_t *));
         if(!_async_queue){
             return false;
         }
@@ -240,7 +240,7 @@ static bool _start_async_task(){
         return false;
     }
     if(!_async_service_task_handle){
-        customTaskCreateUniversal(_async_service_task, "async_tcp", CONFIG_ASYNC_TCP_STACK_SIZE, NULL, 3, &_async_service_task_handle, CONFIG_ASYNC_TCP_RUNNING_CORE);
+        customTaskCreateUniversal(_async_service_task, "async_tcp", CONFIG_ASYNC_TCP_STACK_SIZE, NULL, CONFIG_ASYNC_TCP_PRIORITY, &_async_service_task_handle, CONFIG_ASYNC_TCP_RUNNING_CORE);
         if(!_async_service_task_handle){
             return false;
         }
@@ -581,7 +581,7 @@ AsyncClient::AsyncClient(tcp_pcb* pcb)
 , _tx_last_packet(0)
 , _rx_timeout(0)
 , _rx_last_ack(0)
-, _ack_timeout(ASYNC_MAX_ACK_TIME)
+, _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME)
 , _connect_port(0)
 , prev(NULL)
 , next(NULL)
@@ -589,13 +589,15 @@ AsyncClient::AsyncClient(tcp_pcb* pcb)
     _pcb = pcb;
     _closed_slot = -1;
     if(_pcb){
-        _allocate_closed_slot();
         _rx_last_packet = millis();
         tcp_arg(_pcb, this);
         tcp_recv(_pcb, &_tcp_recv);
         tcp_sent(_pcb, &_tcp_sent);
         tcp_err(_pcb, &_tcp_error);
         tcp_poll(_pcb, &_tcp_poll, 1);
+        if(!_allocate_closed_slot()) {
+            _close();
+        }
     }
 }
 
@@ -697,7 +699,7 @@ void AsyncClient::onPoll(AcConnectHandler cb, void* arg){
 
 bool AsyncClient::_connect(ip_addr_t addr, uint16_t port){
     if (_pcb){
-        log_w("already connected, state %d", _pcb->state);
+        log_d("already connected, state %d", _pcb->state);
         return false;
     }
     if(!_start_async_task()){
@@ -705,7 +707,12 @@ bool AsyncClient::_connect(ip_addr_t addr, uint16_t port){
         return false;
     }
 
-    tcp_pcb* pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
+    if(!_allocate_closed_slot()) {
+        log_e("failed to allocate: closed slot full");
+        return false;
+    }
+
+    tcp_pcb* pcb = tcp_new_ip_type(addr.type);
     if (!pcb){
         log_e("pcb == NULL");
         return false;
@@ -722,12 +729,17 @@ bool AsyncClient::_connect(ip_addr_t addr, uint16_t port){
 
 bool AsyncClient::connect(IPAddress ip, uint16_t port){
     ip_addr_t addr;
-    ip_addr_set_ip4_u32(&addr, ip);
+#if ESP_IDF_VERSION_MAJOR < 5
+    addr.u_addr.ip4.addr = ip;
+    addr.type = IPADDR_TYPE_V4;
+#else
+    ip.to_ip_addr_t(&addr);
+#endif
 
     return _connect(addr, port);
 }
 
-#if LWIP_IPV6
+#if LWIP_IPV6 && ESP_IDF_VERSION_MAJOR < 5
 bool AsyncClient::connect(IPv6Address ip, uint16_t port){
     ip_addr_t addr;
     addr.type = IPADDR_TYPE_V6;
@@ -747,6 +759,7 @@ bool AsyncClient::connect(const char* host, uint16_t port){
 
     err_t err = dns_gethostbyname(host, &addr, (dns_found_callback)&_tcp_dns_found, this);
     if(err == ERR_OK) {
+#if ESP_IDF_VERSION_MAJOR < 5
 #if LWIP_IPV6
         if(addr.type == IPADDR_TYPE_V6) {
             return connect(IPv6Address(addr.u_addr.ip6.addr), port);
@@ -755,11 +768,14 @@ bool AsyncClient::connect(const char* host, uint16_t port){
 #else
         return connect(IPAddress(addr.addr), port);
 #endif
+#else
+        return _connect(addr, port);
+#endif
     } else if(err == ERR_INPROGRESS) {
         _connect_port = port;
         return true;
     }
-    log_e("error: %d", err);
+    log_d("error: %d", err);
     return false;
 }
 
@@ -838,7 +854,6 @@ int8_t AsyncClient::_close(){
     //ets_printf("X: 0x%08x\n", (uint32_t)this);
     int8_t err = ERR_OK;
     if(_pcb) {
-        //log_i("");
         tcp_arg(_pcb, NULL);
         tcp_sent(_pcb, NULL);
         tcp_recv(_pcb, NULL);
@@ -849,6 +864,7 @@ int8_t AsyncClient::_close(){
         if(err != ERR_OK) {
             err = abort();
         }
+        _free_closed_slot();
         _pcb = NULL;
         if(_discard_cb) {
             _discard_cb(_discard_cb_arg, this);
@@ -857,7 +873,10 @@ int8_t AsyncClient::_close(){
     return err;
 }
 
-void AsyncClient::_allocate_closed_slot(){
+bool AsyncClient::_allocate_closed_slot(){
+    if (_closed_slot != -1) {
+        return true;
+    }
     xSemaphoreTake(_slots_lock, portMAX_DELAY);
     uint32_t closed_slot_min_index = 0;
     for (int i = 0; i < _number_of_closed_slots; ++ i) {
@@ -870,27 +889,27 @@ void AsyncClient::_allocate_closed_slot(){
         _closed_slots[_closed_slot] = 0;
     }
     xSemaphoreGive(_slots_lock);
+    return (_closed_slot != -1);
 }
 
 void AsyncClient::_free_closed_slot(){
+    xSemaphoreTake(_slots_lock, portMAX_DELAY);
     if (_closed_slot != -1) {
         _closed_slots[_closed_slot] = _closed_index;
         _closed_slot = -1;
         ++ _closed_index;
     }
+    xSemaphoreGive(_slots_lock);
 }
 
 /*
  * Private Callbacks
  * */
 
-int8_t AsyncClient::_connected(void* pcb, int8_t err){
+int8_t AsyncClient::_connected(tcp_pcb* pcb, int8_t err){
     _pcb = reinterpret_cast<tcp_pcb*>(pcb);
     if(_pcb){
         _rx_last_packet = millis();
-//        tcp_recv(_pcb, &_tcp_recv);
-//        tcp_sent(_pcb, &_tcp_sent);
-//        tcp_poll(_pcb, &_tcp_poll, 1);
     }
     if(_connect_cb) {
         _connect_cb(_connect_cb_arg, this);
@@ -907,6 +926,7 @@ void AsyncClient::_error(int8_t err) {
             tcp_err(_pcb, NULL);
             tcp_poll(_pcb, NULL, 0);
         }
+        _free_closed_slot();
         _pcb = NULL;
     }
     if(_error_cb) {
@@ -920,7 +940,7 @@ void AsyncClient::_error(int8_t err) {
 //In LwIP Thread
 int8_t AsyncClient::_lwip_fin(tcp_pcb* pcb, int8_t err) {
     if(!_pcb || pcb != _pcb){
-        log_e("0x%08x != 0x%08x", (uint32_t)pcb, (uint32_t)_pcb);
+        log_d("0x%08x != 0x%08x", (uint32_t)pcb, (uint32_t)_pcb);
         return ERR_OK;
     }
     tcp_arg(_pcb, NULL);
@@ -948,23 +968,27 @@ int8_t AsyncClient::_fin(tcp_pcb* pcb, int8_t err) {
 }
 
 int8_t AsyncClient::_sent(tcp_pcb* pcb, uint16_t len) {
-    _rx_last_packet = millis();
-    _rx_last_ack = millis();
-    //log_i("%u", len);
+    _rx_last_ack = _rx_last_packet = millis();
     if(_sent_cb) {
-        _sent_cb(_sent_cb_arg, this, len, (millis() - _tx_last_packet));
+        _sent_cb(_sent_cb_arg, this, len, (_rx_last_packet - _tx_last_packet));
     }
     return ERR_OK;
 }
 
 int8_t AsyncClient::_recv(tcp_pcb* pcb, pbuf* pb, int8_t err) {
-    while(pb != NULL) {
+    if(!_pcb || pcb != _pcb){
+        log_d("0x%08x != 0x%08x", (uint32_t)pcb, (uint32_t)_pcb);
+        return ERR_OK;
+    }
+    size_t total = 0;
+    while((pb != NULL) && (ERR_OK == err)) {
         _rx_last_packet = millis();
         //we should not ack before we assimilate the data
         _ack_pcb = true;
         pbuf *b = pb;
         pb = b->next;
         b->next = NULL;
+        total += b->len;
         if(_pb_cb){
             _pb_cb(_pb_cb_arg, this, b);
         } else {
@@ -973,22 +997,20 @@ int8_t AsyncClient::_recv(tcp_pcb* pcb, pbuf* pb, int8_t err) {
             }
             if(!_ack_pcb) {
                 _rx_ack_len += b->len;
-            } else if(_pcb) {
-                _tcp_recved(_pcb, _closed_slot, b->len);
             }
-            pbuf_free(b);
         }
+        pbuf_free(b);
     }
-    return ERR_OK;
+    return _tcp_recved(pcb, _closed_slot, total);
 }
 
 int8_t AsyncClient::_poll(tcp_pcb* pcb){
     if(!_pcb){
-        log_w("pcb is NULL");
+        log_d("pcb is NULL");
         return ERR_OK;
     }
     if(pcb != _pcb){
-        log_e("0x%08x != 0x%08x", (uint32_t)pcb, (uint32_t)_pcb);
+        log_d("0x%08x != 0x%08x", (uint32_t)pcb, (uint32_t)_pcb);
         return ERR_OK;
     }
 
@@ -999,7 +1021,7 @@ int8_t AsyncClient::_poll(tcp_pcb* pcb){
         const uint32_t one_day = 86400000;
         bool last_tx_is_after_last_ack = (_rx_last_ack - _tx_last_packet + one_day) < one_day;
         if(last_tx_is_after_last_ack && (now - _tx_last_packet) >= _ack_timeout) {
-            log_w("ack timeout %d", pcb->state);
+            log_d("ack timeout %d", pcb->state);
             if(_timeout_cb)
                 _timeout_cb(_timeout_cb_arg, this, (now - _tx_last_packet));
             return ERR_OK;
@@ -1007,7 +1029,7 @@ int8_t AsyncClient::_poll(tcp_pcb* pcb){
     }
     // RX Timeout
     if(_rx_timeout && (now - _rx_last_packet) >= (_rx_timeout * 1000)) {
-        log_w("rx timeout %d", pcb->state);
+        log_d("rx timeout %d", pcb->state);
         _close();
         return ERR_OK;
     }
@@ -1019,11 +1041,16 @@ int8_t AsyncClient::_poll(tcp_pcb* pcb){
 }
 
 void AsyncClient::_dns_found(struct ip_addr *ipaddr){
+#if ESP_IDF_VERSION_MAJOR < 5
     if(ipaddr && IP_IS_V4(ipaddr)){
         connect(IPAddress(ip_addr_get_ip4_u32(ipaddr)), _connect_port);
 #if LWIP_IPV6
     } else if(ipaddr && ipaddr->u_addr.ip6.addr){
         connect(IPv6Address(ipaddr->u_addr.ip6.addr), _connect_port);
+#endif
+#else
+    if(ipaddr) {
+        connect(IPAddress(ipaddr), _connect_port);
 #endif
     } else {
         if(_error_cb) {
@@ -1062,8 +1089,11 @@ size_t AsyncClient::write(const char* data) {
 
 size_t AsyncClient::write(const char* data, size_t size, uint8_t apiflags) {
     size_t will_send = add(data, size, apiflags);
-    if(!will_send || !send()) {
+    if(!will_send) {
         return 0;
+    }
+    while (connected() && !send()) {
+        taskYIELD();
     }
     return will_send;
 }
@@ -1102,6 +1132,18 @@ bool AsyncClient::getNoDelay(){
     return tcp_nagle_disabled(_pcb);
 }
 
+void AsyncClient::setKeepAlive(uint32_t ms, uint8_t cnt){
+    if(ms!=0) {
+        _pcb->so_options |= SOF_KEEPALIVE; //Turn on TCP Keepalive for the given pcb
+        // Set the time between keepalive messages in milli-seconds
+        _pcb->keep_idle = ms;
+        _pcb->keep_intvl = ms;
+        _pcb->keep_cnt = cnt; //The number of unanswered probes required to force closure of the socket
+    } else {
+        _pcb->so_options &= ~SOF_KEEPALIVE; //Turn off TCP Keepalive for the given pcb
+    }
+}
+
 uint16_t AsyncClient::getMss(){
     if(!_pcb) {
         return 0;
@@ -1138,7 +1180,7 @@ ip6_addr_t AsyncClient::getLocalAddress6() {
     }
     return _pcb->local_ip.u_addr.ip6;
 }
-
+#if ESP_IDF_VERSION_MAJOR < 5
 IPv6Address AsyncClient::remoteIP6() {
     return IPv6Address(getRemoteAddress6().addr);
 }
@@ -1146,6 +1188,15 @@ IPv6Address AsyncClient::remoteIP6() {
 IPv6Address AsyncClient::localIP6() {
     return IPv6Address(getLocalAddress6().addr);
 }
+#else
+IPAddress AsyncClient::remoteIP6() {
+    return _pcb ? IPAddress(dynamic_cast<const ip_addr_t*>(&_pcb->remote_ip)) : IPAddress(IPType::IPv6);
+}
+
+IPAddress AsyncClient::localIP6() {
+    return _pcb ? IPAddress(dynamic_cast<const ip_addr_t*>(&_pcb->local_ip)) : IPAddress(IPType::IPv6);
+}
+#endif
 #endif
 
 uint16_t AsyncClient::getRemotePort() {
@@ -1174,7 +1225,11 @@ uint16_t AsyncClient::getLocalPort() {
 }
 
 IPAddress AsyncClient::remoteIP() {
+#if ESP_IDF_VERSION_MAJOR < 5
     return IPAddress(getRemoteAddress());
+#else
+    return _pcb ? IPAddress(dynamic_cast<const ip_addr_t*>(&_pcb->remote_ip)) : IPAddress();
+#endif
 }
 
 uint16_t AsyncClient::remotePort() {
@@ -1182,7 +1237,11 @@ uint16_t AsyncClient::remotePort() {
 }
 
 IPAddress AsyncClient::localIP() {
+#if ESP_IDF_VERSION_MAJOR < 5
     return IPAddress(getLocalAddress());
+#else
+    return _pcb ? IPAddress(dynamic_cast<const ip_addr_t*>(&_pcb->local_ip)) : IPAddress();
+#endif
 }
 
 
@@ -1308,7 +1367,7 @@ void AsyncClient::_s_error(void * arg, int8_t err) {
     reinterpret_cast<AsyncClient*>(arg)->_error(err);
 }
 
-int8_t AsyncClient::_s_connected(void * arg, void * pcb, int8_t err){
+int8_t AsyncClient::_s_connected(void * arg, struct tcp_pcb * pcb, int8_t err){
     return reinterpret_cast<AsyncClient*>(arg)->_connected(pcb, err);
 }
 
@@ -1318,7 +1377,13 @@ int8_t AsyncClient::_s_connected(void * arg, void * pcb, int8_t err){
 
 AsyncServer::AsyncServer(IPAddress addr, uint16_t port)
 : _port(port)
+#if ESP_IDF_VERSION_MAJOR < 5
 , _bind4(true)
+, _bind6(false)
+#else
+, _bind4(addr.type() != IPType::IPv6)
+, _bind6(addr.type() == IPType::IPv6)
+#endif
 , _addr(addr)
 , _noDelay(false)
 , _pcb(0)
@@ -1326,8 +1391,10 @@ AsyncServer::AsyncServer(IPAddress addr, uint16_t port)
 , _connect_cb_arg(0)
 {}
 
+#if ESP_IDF_VERSION_MAJOR < 5
 AsyncServer::AsyncServer(IPv6Address addr, uint16_t port)
 : _port(port)
+, _bind4(false)
 , _bind6(true)
 , _addr6(addr)
 , _noDelay(false)
@@ -1335,13 +1402,16 @@ AsyncServer::AsyncServer(IPv6Address addr, uint16_t port)
 , _connect_cb(0)
 , _connect_cb_arg(0)
 {}
+#endif
 
 AsyncServer::AsyncServer(uint16_t port)
 : _port(port)
 , _bind4(true)
-, _bind6(true)
+, _bind6(false)
 , _addr((uint32_t) IPADDR_ANY)
+#if ESP_IDF_VERSION_MAJOR < 5
 , _addr6()
+#endif
 , _noDelay(false)
 , _pcb(0)
 , _connect_cb(0)
@@ -1366,27 +1436,25 @@ void AsyncServer::begin(){
         log_e("failed to start task");
         return;
     }
-    int8_t err, bind_type;
-
-    if(_bind4 && _bind6) {
-        bind_type = IPADDR_TYPE_ANY;
-    } else if (_bind6) {
-        bind_type = IPADDR_TYPE_V6;
-    } else {
-        bind_type = IPADDR_TYPE_V4;
-    }
-
-    _pcb = tcp_new_ip_type(bind_type);
+    int8_t err;
+    _pcb = tcp_new_ip_type(_bind4 && _bind6 ? IPADDR_TYPE_ANY : (_bind6 ? IPADDR_TYPE_V6 : IPADDR_TYPE_V4));
     if (!_pcb){
         log_e("_pcb == NULL");
         return;
     }
 
     ip_addr_t local_addr;
-    ip_addr_set_ip4_u32(&local_addr, _addr);
-/*    local_addr.type = bind_type;
-    local_addr.u_addr.ip4.addr = (uint32_t) _addr;
-    memcpy(local_addr.u_addr.ip6.addr, static_cast<const uint32_t*>(_addr6), sizeof(uint32_t) * 4); */
+#if ESP_IDF_VERSION_MAJOR < 5
+    if (_bind6) { // _bind6 && _bind4 both at the same time is not supported on Arduino 2 in this lib API
+        local_addr.type = IPADDR_TYPE_V6;
+        memcpy(local_addr.u_addr.ip6.addr, static_cast<const uint32_t*>(_addr6), sizeof(uint32_t) * 4);
+    } else {
+        local_addr.type = IPADDR_TYPE_V4;
+        local_addr.u_addr.ip4.addr = _addr;
+    }
+#else
+    _addr.to_ip_addr_t(&local_addr);
+#endif
     err = _tcp_bind(_pcb, &local_addr, _port);
 
     if (err != ERR_OK) {
@@ -1429,7 +1497,7 @@ int8_t AsyncServer::_accept(tcp_pcb* pcb, int8_t err){
     if(tcp_close(pcb) != ERR_OK){
         tcp_abort(pcb);
     }
-    log_e("FAIL");
+    log_d("FAIL");
     return ERR_OK;
 }
 
