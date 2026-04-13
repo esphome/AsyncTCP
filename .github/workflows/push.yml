@@ -14,8 +14,8 @@ jobs:
       matrix:
         os: [ubuntu-latest]
     steps:
-      - uses: actions/checkout@v3
-      - uses: arduino/setup-arduino-cli@v1
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744  # v3.6.0
+      - uses: arduino/setup-arduino-cli@28065f7e0317cc0dde372e0c11631963d743ee3b  # v1.1.2
       - name: Download board
         run: |
           arduino-cli --config-file arduino-cli.yaml core update-index
