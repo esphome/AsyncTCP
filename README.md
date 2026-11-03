@@ -1,3 +1,9 @@
+> [!IMPORTANT]
+> This repository is unmaintained and has been archived.
+>
+> ESPHome and new projects should use the actively maintained
+> [ESP32Async/AsyncTCP](https://github.com/ESP32Async/AsyncTCP) instead.
+
 # AsyncTCP
 ![Build Status](https://github.com/esphome/AsyncTCP/actions/workflows/push.yml/badge.svg)
 A fork of the [AsyncTCP](https://github.com/me-no-dev/AsyncTCP) library by [@me-no-dev](https://github.com/me-no-dev) for [ESPHome](https://esphome.io).
